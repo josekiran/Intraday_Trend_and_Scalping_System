@@ -178,6 +178,11 @@ tradable_df = None                # will be filled after script_list()
 ltp_update_condition = asyncio.Condition()  
 sl_exit_buffer = 0.50  # safe adjustment to avoid Dhan rejection
 
+# ---------------------------
+# Dhan Order Response Statuses (tweakable)
+# ---------------------------
+_NORMAL_ACTIVE_STATUSES = {"TRANSIT", "PENDING", "PART_TRADED"}   # authoritative active statuses
+_NORMAL_TERMINAL_STATUSES = {"REJECTED", "CANCELLED", "TRADED", "EXPIRED"}
 
 # ==============================================================
 #  🧭 Position Manager: Parent Dictionary Structure
@@ -187,29 +192,79 @@ sl_exit_buffer = 0.50  # safe adjustment to avoid Dhan rejection
 # (1) Define Position State Structure for CE/PE legs Tracking
 def _init_position_state():
     """
-    Initialize a clean position state for CE/PE legs.
-    Focuses purely on position and order leg statuses, not prices.
+    Final unified position schema for CE/PE legs.
+    Supports:
+      • Super-order entry (no target leg)
+      • Partial fills → Scalp/Runner split
+      • P&L-based scalp trigger
+      • Scalp SL tightening (LTP - 0.50)
+      • Runner trailing
+      • Trend reversal exits
+      • Clean reconciliation
     """
+
     return {
-        "position": "Unknown",                     # Ready for entry | Entering | Open | Triggered | Exiting
-        "securityId": None,
-        "orderId": None,
-        "quantity": None,
-        "remainingQuantity": None,
-        "orderStatus": None,                       # entry leg textual status (e.g. TRADED / OPEN / CANCELLED)
-        "STOP_LOSS_LEG_remainingQuantity": None,
-        "TARGET_LEG_remainingQuantity": None,
+
+        # ============================================================
+        # 1. HIGH-LEVEL STATE MACHINE
+        # ============================================================
+        #   "Ready for Entry"
+        #   "Entering"
+        #   "Partial Entry"
+        #   "Open - Full"          → Super-order SL intact
+        #   "Open - Scalping"      → +₹1000 reached, scalp pending
+        #   "Open - Trailing"      → scalp executed, runner trailing
+        #   "Trailing Exit"        → runner SL hit
+        #   "Trend Reversal Exit"  → SSMA/LSMA reversal exit
+        #   "Orphan_SL_TG"
+        #   "True_Orphan"
+        #   "Unknown"
+        # ------------------------------------------------------------
+        "position": "Ready for Entry",
+
+        # ============================================================
+        # 2. ENTRY DETAILS (SUPER ORDER)
+        # ============================================================
+        "securityId": None,               # Option instrument ID
+        "super_order_id": None,           # Parent Super-order ID
+        "entry_avg_price": None,              # Option entry price per unit, to be updated after full/ partial fill
+        "super_order_status": None,
+
+        "order_quantity": 0.0,           # Total lots intended (even lots)
+        "remainingQuantity": 0.0,
+        "entered_quantity": 0.0,         # Actual filled quantity
+
+        "scalper_quantity": 0.0,         # derived from entered_quantity (set ONLY in reconcile)
+        "runner_quantity": 0.0,          # derived from entered_quantity (set ONLY in reconcile)
+
+        "STOP_LOSS_LEG_remainingQuantity": 0.0,
         "STOP_LOSS_LEG_status": None,
-        "TARGET_LEG_status": None,
+
+        # ============================================================
+        # 3. NORMAL ORDERS (POST-PROFIT CHECKPOINT ONLY)
+        # ============================================================
+
+        # --- Scalp Exit Order ---
+        "scalp_sl_orderId": None,
+        "scalp_sl_price": None,
+        "scalp_sl_trigger_price": None,
+        "scalp_sl_status": None,          # OPEN / FILLED / CANCELLED
+
+        # --- Runner Exit Order ---
+        "runner_sl_orderId": None,
+        "runner_sl_trigger_price": None,
+        "runner_sl_price": None,
+        "runner_sl_status": None,         # OPEN / FILLED / CANCELLED
+
+        # ============================================================
+        # 4. META INFORMATION
+        # ============================================================
         "last_updated": None,
-        "note": None,
-        # --- Phase 2 fields ---
-        "exit_logic_active": False,                # SSMA-based exit monitoring is OFF initially
-        "entry_timestamp": None,                   # Time of entry
-        "entry_underlying_price": None             # Underlying LTP at entry
+        "note": ""
     }
 
-# (2) Initialize runtime position status for both legs
+
+# Initialize runtime position status
 position_status = {
     "CE": _init_position_state(),
     "PE": _init_position_state()
@@ -936,6 +991,131 @@ def get_super_order_list():
 
 # get_super_order_list()
 
+#===========================================================#
+### 6.3    Get NORMAL Order List from Dhan (REST)
+#===========================================================#
+def get_normal_order_list():
+    """
+    Fetch the NORMAL order book from Dhan API (/v2/orders).
+
+    FINAL RULES:
+        1️⃣ First filter → remainingQuantity > 0
+        2️⃣ From these rows, keep only ACTIVE statuses:
+              TRANSIT, PENDING, PART_TRADED
+        3️⃣ If any TERMINAL statuses appear with remainingQuantity > 0,
+              log warning
+        4️⃣ Always save full snapshot using save_with_snapshot()
+    """
+
+    url = "https://api.dhan.co/v2/orders"
+    headers = {
+        "Content-Type": "application/json",
+        "access-token": api_token
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            logging.error("❌ Normal Order API error: %s — %s",
+                          response.status_code, response.text)
+            df = pd.DataFrame()
+            save_with_snapshot(df, "Normal_Order_List.csv")
+            return df
+
+        raw = response.json()
+
+        # -----------------------------------------------------
+        # Handle API structure (dict-with-data OR plain list)
+        # -----------------------------------------------------
+        if isinstance(raw, dict) and "data" in raw:
+            orders = raw["data"]
+        elif isinstance(raw, list):
+            orders = raw
+        else:
+            logging.error("❌ Unexpected response format: %s", raw)
+            df = pd.DataFrame()
+            save_with_snapshot(df, "Normal_Order_List.csv")
+            return df
+
+        if not orders:
+            logging.warning("⚠️ Empty Normal Order list.")
+            df = pd.DataFrame()
+            save_with_snapshot(df, "Normal_Order_List.csv")
+            return df
+
+        # Convert to DataFrame
+        df = pd.DataFrame(orders)
+        logging.info("✅ Retrieved %d Normal Orders.", len(df))
+
+        # -----------------------------------------------------
+        # Normalize ID fields
+        # -----------------------------------------------------
+        id_cols = [c for c in df.columns if "id" in c.lower()]
+        for col in id_cols:
+            df[col] = df[col].astype(str)
+
+        # Normalize orderStatus
+        if "orderStatus" in df.columns:
+            df["orderStatus"] = df["orderStatus"].astype(str).str.upper().str.strip()
+        else:
+            logging.warning("⚠️ orderStatus missing in Normal Orders.")
+
+        # Ensure remainingQuantity exists
+        if "remainingQuantity" not in df.columns:
+            df["remainingQuantity"] = 0
+
+        # -----------------------------------------------------
+        # STEP 1 → Filter rows with remainingQuantity > 0
+        # -----------------------------------------------------
+        df_qty = df[df["remainingQuantity"].astype(float) > 0].copy()
+        logging.info(f"➡️ After quantity filter: {len(df_qty)} remain.")
+
+        # -----------------------------------------------------
+        # STEP 2 → Filter only ACTIVE statuses
+        # -----------------------------------------------------
+        ACTIVE = {"TRANSIT", "PENDING", "PART_TRADED"}
+        TERMINAL = {"REJECTED", "CANCELLED", "EXPIRED", "TRADED"}
+
+        live_df = df_qty[df_qty["orderStatus"].isin(ACTIVE)].copy()
+        logging.info(f"➡️ Active orders after status filter: {len(live_df)}")
+
+        # -----------------------------------------------------
+        # STEP 3 → Detect terminal statuses with remaining qty
+        # -----------------------------------------------------
+        unexpected_terminal = df_qty[df_qty["orderStatus"].isin(TERMINAL)]
+        if not unexpected_terminal.empty:
+            logging.warning(
+                f"⚠️ Terminal statuses with remainingQuantity>0 (unexpected): "
+                f"{unexpected_terminal['orderStatus'].value_counts().to_dict()}"
+            )
+
+        # -----------------------------------------------------
+        # STEP 4 → Save full snapshot exactly like other methods
+        # -----------------------------------------------------
+        save_with_snapshot(df, "Normal_Order_List.csv")
+        logging.info("📁 Normal Order List saved to runtime + version snapshot.")
+        logging.info("Normal Order file rowcount=%s", len(df))
+
+        # Status summary
+        logging.info("📊 Status Summary:\n%s", df["orderStatus"].value_counts())
+
+        return live_df
+
+    except requests.exceptions.RequestException as e:
+        logging.exception("🌐 Network Error while fetching Normal Order List: %s", e)
+        df = pd.DataFrame()
+        save_with_snapshot(df, "Normal_Order_List.csv")
+        return df
+
+    except Exception as e:
+        logging.exception("❌ Unexpected Error while fetching Normal Order List: %s", e)
+        df = pd.DataFrame()
+        save_with_snapshot(df, "Normal_Order_List.csv")
+        return df
+
+# get_normal_order_list()
+
 # ==============================================================#
 #  Helper Functions for Reconciliation of Orders and Positions
 # ==============================================================#
@@ -948,6 +1128,246 @@ def _safe_col_choice(df, candidates):
         if c in df.columns:
             return c
     return None
+
+def _safe_str_from_df(df, col_candidates):
+    """Return the first string value from first available candidate column."""
+    if df is None or df.empty:
+        return None
+    col = _safe_col_choice(df, col_candidates)
+    if col is None:
+        return None
+    try:
+        v = df[col].astype(str).iloc[0]
+        return v
+    except Exception:
+        return None
+
+
+# ---------------------------
+# Normal-order helpers
+# ---------------------------
+def _filter_leg_normal_orders(normal_df, tradable_df, option_type):
+    """
+    Return normal orders (DataFrame) that match SECURITY_IDs for option_type
+    and are STOP_LOSS + SELL type rows (if columns available).
+    """
+    try:
+        if normal_df is None or normal_df.empty:
+            return pd.DataFrame()
+        ids = tradable_df[tradable_df['OPTION_TYPE'] == option_type]['SECURITY_ID'].astype(str).tolist()
+        if not ids:
+            return pd.DataFrame()
+        sec_col = _safe_col_choice(normal_df, ["securityId", "SECURITY_ID", "security_id", "SecurityId", "SecurityID"])
+        if sec_col is None:
+            return pd.DataFrame()
+        df = normal_df[normal_df[sec_col].astype(str).isin(ids)].copy()
+        if df.empty:
+            return pd.DataFrame()
+        # Normalize common columns
+        if "orderStatus" in df.columns:
+            df["orderStatus"] = df["orderStatus"].astype(str).str.upper().str.strip()
+        if "orderType" in df.columns:
+            df["orderType"] = df["orderType"].astype(str).str.upper().str.strip()
+        if "transactionType" in df.columns:
+            df["transactionType"] = df["transactionType"].astype(str).str.upper().str.strip()
+        # Filter STOP_LOSS + SELL if those columns exist
+        if "orderType" in df.columns:
+            df = df[df["orderType"] == "STOP_LOSS"]
+        if "transactionType" in df.columns:
+            df = df[df["transactionType"] == "SELL"]
+        return df
+    except Exception:
+        logging.exception("Error in _filter_leg_normal_orders()")
+        return pd.DataFrame()
+
+
+def _get_active_normal_sl_list(normal_df_slice):
+    """
+    From a filtered normal orders DF, return a list of active STOP_LOSS orders (pd.Series rows).
+    Active statuses per Dhan: TRANSIT, PENDING, PART_TRADED
+    Only include rows with remainingQuantity > 0.
+    """
+    out = []
+    try:
+        if normal_df_slice is None or normal_df_slice.empty:
+            return out
+
+        rem_col = _safe_col_choice(normal_df_slice, ["remainingQuantity", "remaining_quantity", "remainingQty", "remaining_qty"])
+        status_col = _safe_col_choice(normal_df_slice, ["orderStatus", "order_status", "ORDER_STATUS"])
+
+        for _, r in normal_df_slice.iterrows():
+            try:
+                rem = float(r.get(rem_col, 0)) if rem_col else float(r.get("remainingQuantity", 0) or 0)
+            except Exception:
+                rem = 0.0
+            st = str(r.get(status_col, "")).upper() if status_col else ""
+            if rem > 0 and (st in _NORMAL_ACTIVE_STATUSES or status_col is None):
+                out.append(r)
+        # sort ascending by remaining to help assignment
+        def _rem_val(row):
+            try:
+                if rem_col:
+                    return float(row.get(rem_col) or 0)
+                return float(row.get("remainingQuantity") or 0)
+            except Exception:
+                return 0.0
+        out_sorted = sorted(out, key=_rem_val)
+        return out_sorted
+    except Exception:
+        logging.exception("Error in _get_active_normal_sl_list()")
+        return []
+
+
+def _sum_normal_sl_remaining(normal_sl_list):
+    """Sum remainingQuantity from the normal_stop_loss list"""
+    s = 0.0
+    try:
+        if not normal_sl_list:
+            return 0.0
+        for r in normal_sl_list:
+            for c in ("remainingQuantity", "remaining_quantity", "remainingQty", "remaining_qty"):
+                try:
+                    if c in r.index:
+                        s += float(r.get(c) or 0)
+                        break
+                    if isinstance(r, dict) and c in r:
+                        s += float(r.get(c) or 0)
+                        break
+                except Exception:
+                    continue
+        return s
+    except Exception:
+        logging.exception("Error in _sum_normal_sl_remaining()")
+        return 0.0
+
+def safe_float(v, default=0.0):
+    """Safe numeric parse returning float or default."""
+    try:
+        if v in (None, "", "NaN", "nan"):
+            return float(default)
+        return float(pd.to_numeric(v, errors="coerce") or default)
+    except Exception:
+        return float(default)
+
+def _compute_scalper_runner_quantities(entered_qty_units, lot_size=1):
+    """
+    Compute scalper and runner quantities in UNITS, respecting lot size.
+
+    Steps:
+        1) Convert entered_qty_units → lots
+        2) Split lots: scalper_lots = floor(lots/2), runner_lots = remainder
+        3) Convert back to units
+    """
+
+    try:
+        units = int(entered_qty_units or 0)
+        lot = int(lot_size or 1)
+        if lot <= 0:
+            lot = 1
+
+        # Convert units → whole lots
+        lots = units // lot
+
+        # Safety: warn if fractional units present
+        remainder_units = units % lot
+        if remainder_units != 0:
+            logging.warning(
+                f"[LotMismatch] Qty {units} not multiple of lot_size {lot}. "
+                f"Ignoring {remainder_units} units."
+            )
+
+        # Nothing to split
+        if lots == 0:
+            return 0, 0
+
+        # Split lots
+        scalper_lots = lots // 2
+        runner_lots = lots - scalper_lots
+
+        # Convert back to units
+        scalper_units = scalper_lots * lot
+        runner_units = runner_lots * lot
+
+        logging.debug("Split units=%s into lots=%s -> scalper_lots=%s runner_lots=%s => scalper_units=%s runner_units=%s",
+                      units, lots, scalper_lots, runner_lots, scalper_units, runner_units)
+
+        return scalper_units, runner_units
+
+    except Exception as e:
+        logging.exception("Error computing lot-aware scalper/runner quantities: %s", e)
+        return 0, 0
+
+
+def _assign_scalper_and_runner(normal_sl_list, entered_qty, state=None):
+    """
+    Given active normal SL orders (list of Series/dicts), assign which is scalper and which is runner.
+    Returns (scalp_order, runner_order) where each is a row (pd.Series) or None.
+    """
+    try:
+        if not normal_sl_list:
+            return None, None
+
+        def rem_val(row):
+            for c in ("remainingQuantity", "remaining_quantity", "remainingQty", "remaining_qty"):
+                if c in row.index:
+                    try:
+                        return float(row.get(c) or 0)
+                    except Exception:
+                        continue
+            # dict fallback
+            try:
+                if isinstance(row, dict):
+                    for c in ("remainingQuantity", "remaining_quantity", "remainingQty", "remaining_qty"):
+                        if c in row:
+                            return float(row.get(c) or 0)
+            except Exception:
+                pass
+            return 0.0
+
+        # prefer matching by saved orderIds in state if present
+        saved_scalp_id = state.get("scalp_sl_orderId") if state else None
+        saved_runner_id = state.get("runner_sl_orderId") if state else None
+
+        def order_id_of(row):
+            for c in ("orderId", "order_id", "ORDER_ID"):
+                if c in row.index:
+                    return str(row.get(c))
+            if isinstance(row, dict):
+                for c in ("orderId", "order_id", "ORDER_ID"):
+                    if c in row:
+                        return str(row.get(c))
+            return None
+
+        if saved_scalp_id or saved_runner_id:
+            scalp_row = None
+            runner_row = None
+            for r in normal_sl_list:
+                oid = order_id_of(r)
+                if oid and saved_scalp_id and str(oid) == str(saved_scalp_id):
+                    scalp_row = r
+                if oid and saved_runner_id and str(oid) == str(saved_runner_id):
+                    runner_row = r
+            if scalp_row or runner_row:
+                return scalp_row, runner_row
+
+        ln = len(normal_sl_list)
+        if ln == 2:
+            sorted_rows = sorted(normal_sl_list, key=rem_val)
+            r_small, r_large = sorted_rows[0], sorted_rows[1]
+            # even/odd split based on entered_qty
+            try:
+                eq = int(entered_qty or 0)
+            except Exception:
+                eq = 0
+            # runner = larger remaining (gives extra if odd)
+            return r_small, r_large
+        elif ln == 1:
+            return None, normal_sl_list[0]
+        else:
+            return None, None
+    except Exception:
+        logging.exception("Error in _assign_scalper_and_runner()")
+        return None, None
 
 
 def cancel_super_order_leg(order_id, order_leg):
@@ -998,6 +1418,154 @@ def cancel_super_order_leg(order_id, order_leg):
         return False, f"exception: {e}"
 
 
+def cancel_normal_sl_order(order_id):
+    """
+    Cancel a normal STOP_LOSS SELL order via Dhan API.
+    Direct low-level API function (no retries here).
+    Returns (ok_flag, response_dict_or_text).
+    """
+    global api_token
+
+    if not order_id:
+        logging.warning("⚠️ cancel_normal_sl_order() called without order_id")
+        return False, "invalid_order_id"
+
+    url = f"https://api.dhan.co/v2/orders/{order_id}"
+    headers = {
+        "Content-Type": "application/json",
+        "access-token": api_token
+    }
+
+    logging.info("🟡 Attempting normal SL cancel — orderId=%s", order_id)
+
+    try:
+        resp = requests.delete(url, headers=headers, timeout=8)
+
+        # SUCCESS
+        if resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {"status": "cancelled_no_json"}
+
+            logging.info("🟢 Normal SL Cancel Successful — orderId=%s", order_id)
+            return True, payload
+
+        # KNOWN API FAILURE (e.g., already cancelled)
+        elif resp.status_code in (400, 404):
+            logging.warning("⚠️ Normal SL Cancel failed — orderId=%s | %s",
+                            order_id, resp.text)
+            return False, resp.text
+
+        # OTHER ERRORS
+        else:
+            logging.error("❌ Normal SL Cancel failed — orderId=%s | Status=%s | Response=%s",
+                          order_id, resp.status_code, resp.text)
+            return False, resp.text
+
+    except Exception as e:
+        logging.exception("❌ Exception during normal SL cancel (%s): %s",
+                          order_id, e)
+        return False, f"exception: {e}"
+
+# ---------------------------
+# Cancel retry wrappers (use existing cancel functions)
+# ---------------------------
+def _retry_cancel_super_leg(super_order_id, order_leg, retries=2, backoff_secs=1):
+    """Retry wrapper for cancel_super_order_leg(super_order_id, order_leg)."""
+    try:
+        last_err = None
+        for attempt in range(retries + 1):
+            ok, resp = cancel_super_order_leg(super_order_id, order_leg)
+            if ok:
+                return True, resp
+            last_err = resp
+            time.sleep(backoff_secs * (2 ** attempt))
+        return False, last_err
+    except Exception as e:
+        logging.exception("Error in _retry_cancel_super_leg(): %s", e)
+        return False, str(e)
+
+
+def _retry_cancel_normal(order_id, retries=2, backoff_secs=1):
+    """Retry wrapper for cancel_normal_sl_order(order_id)."""
+    try:
+        last_err = None
+        for attempt in range(retries + 1):
+            ok = cancel_normal_sl_order(order_id)
+            if isinstance(ok, tuple):
+                ok_flag = ok[0]
+            else:
+                ok_flag = bool(ok)
+            if ok_flag:
+                return True, ok
+            last_err = ok
+            time.sleep(backoff_secs * (2 ** attempt))
+        return False, last_err
+    except Exception as e:
+        logging.exception("Error in _retry_cancel_normal(): %s", e)
+        return False, str(e)
+
+
+# ---------------------------
+# Cleanup wrappers
+# ---------------------------
+def _cleanup_inconsistent_super_plus_normal(super_orders_rows, normal_sl_list):
+    """
+    Cancel super-order STOP_LOSS_LEG when normal SLs exist.
+    Returns (success_flag, details)
+    """
+    try:
+        if (super_orders_rows is None or super_orders_rows.empty) or not normal_sl_list:
+            return True, "nothing_to_do"
+        any_failed = False
+        detail = []
+        for _, srow in super_orders_rows.iterrows():
+            soid = srow.get("orderId") or srow.get("ORDER_ID") or srow.get("order_id")
+            if not soid:
+                continue
+            ok, resp = _retry_cancel_super_leg(soid, "STOP_LOSS_LEG")
+            detail.append((soid, ok, resp))
+            if not ok:
+                any_failed = True
+        return (not any_failed), detail
+    except Exception as e:
+        logging.exception("Error in _cleanup_inconsistent_super_plus_normal(): %s", e)
+        return False, str(e)
+
+def _cleanup_orphan_sl(super_orders_rows, normal_sl_list):
+    """
+    Cancel super-order SL legs and normal SL orders when net == 0 and SLs remain.
+    Returns (success_flag, details)
+    """
+    try:
+        results = {"super": [], "normal": []}
+        # Cancel super-order SL legs
+        if super_orders_rows is not None and not super_orders_rows.empty:
+            for _, srow in super_orders_rows.iterrows():
+                soid = srow.get("orderId") or srow.get("ORDER_ID") or srow.get("order_id")
+                if soid:
+                    ok, resp = _retry_cancel_super_leg(soid, "STOP_LOSS_LEG")
+                    results["super"].append((soid, ok, resp))
+        # Cancel normal SLs
+        for r in normal_sl_list or []:
+            oid = None
+            for c in ("orderId", "order_id", "ORDER_ID"):
+                if c in r.index:
+                    oid = r.get(c)
+                    break
+            if not oid and isinstance(r, dict):
+                oid = r.get("orderId") or r.get("order_id")
+            if oid:
+                ok, resp = _retry_cancel_normal(oid)
+                results["normal"].append((oid, ok, resp))
+        any_fail = any(not item[1] for group in results.values() for item in group)
+        return (not any_fail), results
+    except Exception as e:
+        logging.exception("Error in _cleanup_orphan_sl(): %s", e)
+        return False, str(e)
+
+
 def _find_order_row_by_orderid(orders_df, order_id):
     """Locate a specific order row by orderId in a dataframe."""
     if orders_df is None or orders_df.empty or not order_id:
@@ -1026,20 +1594,6 @@ def _rows_for_option_type(df, tradable_df, option_type):
     if sec_col is None:
         return pd.DataFrame()
     return df[df[sec_col].astype(str).isin(ids)].copy()
-
-
-def _safe_str_from_df(df, col_candidates):
-    """Return the first string value from first available candidate column."""
-    if df is None or df.empty:
-        return None
-    col = _safe_col_choice(df, col_candidates)
-    if col is None:
-        return None
-    try:
-        v = df[col].astype(str).iloc[0]
-        return v
-    except Exception:
-        return None
 
 
 def _filter_leg_positions(positions_df, tradable_df, option_type):
@@ -1140,74 +1694,164 @@ def _is_order_stale(order_row, cutoff_seconds):
         return False
 
 
-def _classify_state_by_qty(net_qty, rem_entry, rem_sl, rem_tg, order_present):
+# ---------------------------
+# Unified classifier
+# ---------------------------
+def _classify_unified_state(net_qty, rem_entry, super_sl_rem, normal_sl_total,
+                            entered_qty, normal_sl_list, super_orders_rows,
+                            prev_state=None, lot_size=1):
     """
-    Classify numeric state based on position/order quantities.
-    Returns one of:
-      - Ready_for_entry
-      - Entering
-      - Partial_Entry
-      - Open
-      - SL_Triggered / TG_Triggered
-      - Orphan_SL_TG / True_Orphan / Unknown
+    Unified classifier returning a (classification, meta) tuple.
+
+    meta contains:
+      - reason: human-friendly explanation
+      - sn, rn: booleans for scalp/runner presence
+      - scalp_order, runner_order: assigned normal order rows (Series/dict) or None
+      - scalper_qty, runner_qty: computed unit quantities (respecting lot_size)
+      - rem_sl_total: total remaining SL quantity (super + normal)
+      - lot_size: resolved lot_size used
     """
-    def safe_f(v):
-        try:
-            if v in (None, "", "NaN", "nan"): 
-                return 0.0
-            return float(pd.to_numeric(v, errors='coerce') or 0.0)
-        except Exception:
-            return 0.0
+    meta = {
+        "reason": None,
+        "sn": False,
+        "rn": False,
+        "scalp_order": None,
+        "runner_order": None,
+        "scalper_qty": 0,
+        "runner_qty": 0,
+        "rem_sl_total": 0
+    }
+    try:
+        # --- safe numeric conversion ---
+        net = safe_float(net_qty, 0.0)
+        re = safe_float(rem_entry, 0.0)
+        rs = safe_float(super_sl_rem, 0.0)
+        ns = safe_float(normal_sl_total, 0.0)
+        rem_sl_total = rs + ns
+        meta["rem_sl_total"] = rem_sl_total
 
-    net, re, rs, rt = map(safe_f, [net_qty, rem_entry, rem_sl, rem_tg])
+        # --- compute lot-aware scalper/runner units ---
+        scalper_qty, runner_qty = _compute_scalper_runner_quantities(entered_qty, lot_size)
+        meta["scalper_qty"] = scalper_qty
+        meta["runner_qty"] = runner_qty
+        meta["lot_size"] = lot_size
 
-    # All zeros → ready
-    if net == 0 and re == 0 and rs == 0 and rt == 0:
-        return "Ready_for_entry"
+        # --- assign scalp/runner orders if present ---
+        scalp_row, runner_row = _assign_scalper_and_runner(normal_sl_list, entered_qty, state=prev_state or {})
+        ln = len(normal_sl_list or [])
+        if ln == 2:
+            meta["sn"] = True
+            meta["rn"] = True
+            meta["scalp_order"] = scalp_row
+            meta["runner_order"] = runner_row
+        elif ln == 1:
+            meta["sn"] = False
+            meta["rn"] = True
+            meta["scalp_order"] = None
+            meta["runner_order"] = normal_sl_list[0]
+        else:
+            meta["sn"] = False
+            meta["rn"] = False
 
-    # Net == 0 but entry pending
-    if net == 0 and re > 0:
-        return "Entering"
+        # -------------------------------------------------------
+        # RULES (priority order)
+        # -------------------------------------------------------
+        # 1) No net, no entry, no SL -> Ready for entry
+        if net == 0 and re == 0 and rem_sl_total == 0 and not meta["sn"] and not meta["rn"]:
+            meta["reason"] = "no net, no entry, no SL (super/normal)"
+            logging.info("Classifier -> Ready for Entry (%s)", meta["reason"])
+            return "Ready for Entry", meta
 
-    # Net > 0
-    if net > 0:
-        if re > 0:
-            return "Partial_Entry"
-        if re == 0 and (rs > 0 or rt > 0):
-            if rs > 0 and rt > 0:
-                return "Open"
-            if rt > 0:
-                return "TG_Triggered"
+        # 2) Entry pending
+        if net == 0 and re > 0:
+            meta["reason"] = "entry pending"
+            logging.info("Classifier -> Entering (%s)", meta["reason"])
+            return "Entering", meta
+
+        # 3) Partial fill (net > 0 but entry still has remaining)
+        if net > 0 and re > 0:
+            meta["reason"] = "partial fill"
+            logging.info("Classifier -> Partial Entry (%s)", meta["reason"])
+            return "Partial Entry", meta
+
+        # 4) Open cases with SLs
+        if net > 0 and re == 0 and rem_sl_total > 0:
+            # inconsistent both super SL and normal SLs
+            if rs > 0 and ln > 0:
+                meta["reason"] = "both super SL and normal SL exist (inconsistent)"
+                logging.warning("Classifier -> inconsistent super+normal SL (%s)", meta["reason"])
+                if ln == 2:
+                    return "Open - Scalping", meta
+                elif ln == 1:
+                    return "Open - Trailing", meta
+                else:
+                    return "Open - Full", meta
+
+            # normal SLs present
+            if ln == 2:
+                meta["reason"] = "two normal SLs -> scalp + runner pending"
+                logging.info("Classifier -> Open - Scalping (%s)", meta["reason"])
+                return "Open - Scalping", meta
+            if ln == 1:
+                meta["reason"] = "one normal SL -> runner pending"
+                logging.info("Classifier -> Open - Trailing (%s)", meta["reason"])
+                return "Open - Trailing", meta
+
+            # only super SL present
             if rs > 0:
-                return "SL_Triggered"
-        if re == 0 and rs == 0 and rt == 0:
-            return "Open" if order_present else "True_Orphan"
+                meta["reason"] = "super-order SL active and no normal SLs"
+                logging.info("Classifier -> Open - Full (%s)", meta["reason"])
+                return "Open - Full", meta
 
-    # Orphan SL/TG
-    if net == 0 and (rs > 0 or rt > 0):
-        return "Orphan_SL_TG"
+            # fallback
+            meta["reason"] = "open with SL present (fallback)"
+            logging.info("Classifier -> Open - Full (fallback)")
+            return "Open - Full", meta
 
-    return "Unknown"
+        # 5) Orphan SLs (no net but SLs exist)
+        if net == 0 and rem_sl_total > 0:
+            meta["reason"] = "no net but SLs exist (orphan)"
+            logging.warning("Classifier -> Orphan_SL (%s)", meta["reason"])
+            return "Orphan_SL", meta
+
+        # 6) True orphan: net present but no SL protection
+        if net > 0 and re == 0 and rem_sl_total == 0:
+            meta["reason"] = "net present but no SL protection -> true orphan"
+            logging.warning("Classifier -> True_Orphan (%s)", meta["reason"])
+            return "True_Orphan", meta
+
+        # otherwise unknown
+        meta["reason"] = "unknown - did not match rules"
+        logging.error("Classifier -> Unknown (%s) | inputs net=%s re=%s rs=%s ns=%s", meta["reason"], net, re, rs, ns)
+        return "Unknown", meta
+
+    except Exception as e:
+        logging.exception("Error in _classify_unified_state(): %s", e)
+        meta["reason"] = f"exception: {e}"
+        return "Unknown", meta
 
 # -----------------------------
 # Main reconcile function
 # -----------------------------
 def reconcile_orders_and_positions(mode='startup', minutes_pending_cutoff=2.5):
     """
-    Reconcile positions and super orders using explicit numeric logic.
-    Modes: startup, mid, end
-    Cancels stale entries and orphan SL/TG automatically.
+    Reconcile positions and orders into authoritative position_status per leg.
+
+    - Modes: 'startup', 'mid', 'end' (affects stale-entry cleanup earlier in code)
+    - Performs Dhan-cleanup only in allowed cases:
+        * inconsistent super+normal SL (cancel super SL)
+        * orphan SLs (net==0 but SLs exist) -> cancel SLs
     """
     global position_status, tradable_df
     tag = mode.upper()
-    logging.info(f"🔹 Starting {tag} reconciliation cycle")
+    logging.info("🔹 Starting %s reconciliation cycle (unified)", tag)
 
     with POSITION_LOCK:
-        logging.info(f"🔒 POSITION_LOCK acquired for {tag} reconciliation.")
+        logging.info("🔒 POSITION_LOCK acquired for %s reconciliation.", tag)
 
         # Candle timing
         try:
-            candle_interval_sec = interval * 60
+            candle_interval_sec = int(interval) * 60
         except Exception:
             candle_interval_sec = 300
 
@@ -1220,17 +1864,11 @@ def reconcile_orders_and_positions(mode='startup', minutes_pending_cutoff=2.5):
                            if remaining_to_mid > 0
                            else next_candle_time - timedelta(seconds=candle_interval_sec / 2))
 
-        logging.info(
-            "🕒 Candle timing — mid: %s | next: %s | Polling stops 10s before either.",
-            mid_candle_time.strftime("%H:%M:%S"),
-            next_candle_time.strftime("%H:%M:%S"),
-        )
+        logging.info("🕒 Candle timing — mid: %s | next: %s", mid_candle_time.strftime("%H:%M:%S"), next_candle_time.strftime("%H:%M:%S"))
 
-        # Fetch data
+        # Fetch data (positions, super orders, normal orders)
         try:
-            positions_df = get_positions()
-            if positions_df is None or positions_df.empty:
-                positions_df = pd.DataFrame()
+            positions_df = get_positions() or pd.DataFrame()
             pos_success = True
         except Exception as e:
             logging.exception("get_positions() failed: %s", e)
@@ -1238,16 +1876,22 @@ def reconcile_orders_and_positions(mode='startup', minutes_pending_cutoff=2.5):
             pos_success = False
 
         try:
-            orders_df = get_super_order_list()
-            if orders_df is None or orders_df.empty:
-                orders_df = pd.DataFrame()
+            orders_df = get_super_order_list() or pd.DataFrame()
             ord_success = True
         except Exception as e:
             logging.exception("get_super_order_list() failed: %s", e)
             orders_df = pd.DataFrame()
             ord_success = False
 
-        if not pos_success or not ord_success:
+        try:
+            normal_df = get_normal_order_list() or pd.DataFrame()
+            norm_success = True
+        except Exception as e:
+            logging.exception("get_normal_order_list() failed: %s", e)
+            normal_df = pd.DataFrame()
+            norm_success = False
+
+        if not pos_success or not ord_success or not norm_success:
             logging.warning("⚠️ API failure — cannot reconcile.")
             for leg_type in ["CE", "PE"]:
                 position_status[leg_type] = _init_position_state()
@@ -1258,8 +1902,9 @@ def reconcile_orders_and_positions(mode='startup', minutes_pending_cutoff=2.5):
                 })
             return position_status
 
-        # Empty => Ready
-        if positions_df.empty and orders_df.empty:
+        # Quick-empty check
+        if positions_df.empty and orders_df.empty and normal_df.empty:
+            logging.info("No positions/orders found -> marking all legs Ready for entry")
             for leg_type in ["CE", "PE"]:
                 position_status[leg_type] = _init_position_state()
                 position_status[leg_type].update({
@@ -1285,10 +1930,13 @@ def reconcile_orders_and_positions(mode='startup', minutes_pending_cutoff=2.5):
         try:
             ord_sec_col = _safe_col_choice(orders_df, ["securityId", "SECURITY_ID", "security_id"])
             pos_sec_col = _safe_col_choice(positions_df, ["securityId", "SECURITY_ID", "security_id"])
+            norm_sec_col = _safe_col_choice(normal_df, ["securityId", "SECURITY_ID", "security_id"])
             if ord_sec_col:
                 orders_df = orders_df[orders_df[ord_sec_col].astype(str).isin(valid_ids)]
             if pos_sec_col:
                 positions_df = positions_df[positions_df[pos_sec_col].astype(str).isin(valid_ids)]
+            if norm_sec_col:
+                normal_df = normal_df[normal_df[norm_sec_col].astype(str).isin(valid_ids)]
         except Exception:
             logging.exception("Error filtering to tradable IDs.")
 
@@ -1296,239 +1944,284 @@ def reconcile_orders_and_positions(mode='startup', minutes_pending_cutoff=2.5):
         for leg_type in ["CE", "PE"]:
             try:
                 state = _init_position_state()
+
+                # Filter relevant rows
                 pos_rows = _filter_leg_positions(positions_df, tradable_df, leg_type)
-                ord_rows = _filter_leg_orders(orders_df, tradable_df, leg_type)
-                logging.info("Processing %s | pos=%d | ord=%d", leg_type, len(pos_rows), len(ord_rows))
+                super_ord_rows = _filter_leg_orders(orders_df, tradable_df, leg_type)
+                normal_rows = _filter_leg_normal_orders(normal_df, tradable_df, leg_type)
 
-                net_qty = float(pos_rows["netQty"].sum()) if "netQty" in pos_rows else 0.0
-                rem_entry = float(ord_rows["remainingQuantity"].sum()) if "remainingQuantity" in ord_rows else 0.0
-                rem_sl = float(ord_rows["STOP_LOSS_LEG_remainingQuantity"].sum()) if "STOP_LOSS_LEG_remainingQuantity" in ord_rows else 0.0
-                rem_tg = float(ord_rows["TARGET_LEG_remainingQuantity"].sum()) if "TARGET_LEG_remainingQuantity" in ord_rows else 0.0
+                logging.info("Processing %s | pos=%d | super_ord=%d | normal_ord=%d",
+                             leg_type, len(pos_rows), len(super_ord_rows), len(normal_rows))
 
-                order_id = _safe_str_from_df(ord_rows, ['orderId', 'ORDER_ID'])
+                # Numeric aggregation
+                net_qty = safe_float(pos_rows["netQty"].sum()) if "netQty" in pos_rows else 0.0
+                rem_entry = safe_float(super_ord_rows["remainingQuantity"].sum()) if "remainingQuantity" in super_ord_rows else 0.0
+                super_sl_rem = safe_float(super_ord_rows["STOP_LOSS_LEG_remainingQuantity"].sum()) if "STOP_LOSS_LEG_remainingQuantity" in super_ord_rows else 0.0
+                normal_sl_list = _get_active_normal_sl_list(normal_rows)
+                normal_sl_total = _sum_normal_sl_remaining(normal_sl_list)
+                entered_qty = safe_float(pos_rows["netQty"].sum()) if "netQty" in pos_rows else 0.0
+
+                len_n = len(normal_sl_list)
+                order_id = _safe_str_from_df(super_ord_rows, ['orderId', 'ORDER_ID'])
                 order_present = bool(order_id)
-                classification = _classify_state_by_qty(net_qty, rem_entry, rem_sl, rem_tg, order_present)
-                secid = _safe_str_from_df(pos_rows, ['securityId', 'SECURITY_ID']) or _safe_str_from_df(ord_rows, ['securityId', 'SECURITY_ID'])
-                logging.info("%s classified as %s (net=%.1f, entry=%.1f, SL=%.1f, TG=%.1f)", leg_type, classification, net_qty, rem_entry, rem_sl, rem_tg)
+                secid = _safe_str_from_df(pos_rows, ['securityId', 'SECURITY_ID']) or _safe_str_from_df(super_ord_rows, ['securityId', 'SECURITY_ID'])
 
-                # Cancel stale entries in mid/end
-                if mode in ('mid', 'end') and classification in ("Entering", "Partial_Entry"):
-                    for _, orow in ord_rows.iterrows():
+                logging.debug("%s numeric inputs net=%s re=%s super_sl=%s normal_sl=%s entered=%s",
+                              leg_type, net_qty, rem_entry, super_sl_rem, normal_sl_total, entered_qty)
+
+                # -----------------------------------------
+                # LOT SIZE RESOLUTION (from tradable_df) 
+                # -----------------------------------------
+                try:
+                    lot_size = 1.0
+                    if secid is not None:
+                        lot_row = tradable_df.loc[tradable_df["SECURITY_ID"].astype(str) == str(secid)]
+                        if len(lot_row) > 0 and "LOT_SIZE" in lot_row.columns:
+                            lot_size = safe_float(lot_row["LOT_SIZE"].iloc[0], 1.0)
+                except Exception:
+                    lot_size = 1.0
+                    logging.exception("Could not determine lot_size for %s (secid=%s)", leg_type, secid)
+
+                state["lot_size"] = lot_size
+
+                # -----------------------
+                # CLEANUP PHASE (pre-classify)
+                # -----------------------
+                # 1) inconsistent: super SL + normal SL -> cancel super SL
+                if super_sl_rem > 0 and len_n > 0:
+                    logging.warning("⚠️ %s: Inconsistent state — super SL + normal SL present -> attempt cancel super SL", leg_type)
+                    ok, details = _cleanup_inconsistent_super_plus_normal(super_ord_rows, normal_sl_list)
+                    if not ok:
+                        logging.error("❌ %s: Failed to cleanup inconsistent super SL -> %s", leg_type, details)
+                        state["note"] = f"Inconsistent SL cleanup attempted — some cancels failed: {details}"
+                    else:
+                        logging.info("🟢 %s: Inconsistent super SL cleaned -> re-fetching super orders", leg_type)
                         try:
-                            if _is_order_stale(orow, minutes_pending_cutoff * 60):
-                                stale_id = orow.get("orderId")
-                                if stale_id:
-                                    logging.warning(f"⚠️ {leg_type}: stale entry {stale_id} -> cancelling ENTRY_LEG")
-                                    cancel_super_order_leg(stale_id, "ENTRY_LEG")
+                            orders_df2 = get_super_order_list() or pd.DataFrame()
+                            if ord_sec_col:
+                                super_ord_rows = orders_df2[orders_df2[ord_sec_col].astype(str).isin(valid_ids)]
+                            super_sl_rem = safe_float(super_ord_rows["STOP_LOSS_LEG_remainingQuantity"].sum()) if "STOP_LOSS_LEG_remainingQuantity" in super_ord_rows else 0.0
                         except Exception:
-                            continue
+                            logging.exception("Error reloading super orders after cleanup")
 
-                # ----------------------------------------------------------
-                # Classification → State Mapping (Hybrid Full Version)
-                # ----------------------------------------------------------
-                if classification == "Ready_for_entry":
+                # 2) Orphan cleanup: net==0 and any SLs exist -> cancel them and set Ready
+                if net_qty == 0 and (super_sl_rem > 0 or len_n > 0):
+                    logging.warning("⚠️ %s: orphan SL detected (net=0, SL exists) -> attempting cleanup", leg_type)
+                    ok, details = _cleanup_orphan_sl(super_ord_rows, normal_sl_list)
+                    if ok:
+                        logging.info("🟢 %s: orphan SL cleanup succeeded -> marking Ready for entry", leg_type)
+                        state = _init_position_state()
+                        state.update({
+                            "position": "Ready for Entry",
+                            "note": "Orphan SLs cleaned up",
+                            "last_updated": datetime.now(kolkata_tz)
+                        })
+                        position_status[leg_type] = state
+                        continue  # next leg
+                    else:
+                        logging.error("❌ %s: orphan SL cleanup attempted but some cancellations failed: %s", leg_type, details)
+                        state.update({
+                            "position": "Orphan_SL",
+                            "note": f"Orphan cleanup attempted but failed: {details}",
+                            "last_updated": datetime.now(kolkata_tz)
+                        })
+                        position_status[leg_type] = state
+                        continue  # next leg
+
+                # -----------------------
+                # CLASSIFICATION PHASE
+                # -----------------------
+                classification, meta = _classify_unified_state(
+                    net_qty, rem_entry, super_sl_rem, normal_sl_total,
+                    entered_qty, normal_sl_list, super_ord_rows,
+                    prev_state=position_status.get(leg_type),
+                    lot_size=lot_size
+                )
+
+                logging.info("%s classified as %s | reason=%s", leg_type, classification, meta.get("reason"))
+
+                prev_state = position_status.get(leg_type, {}) or {}
+                scalper_qty, runner_qty = _compute_scalper_runner_quantities(entered_qty, lot_size)
+
+                # base assignments
+                state["securityId"] = secid
+                state["super_order_id"] = order_id
+                state["super_order_status"] = _safe_str_from_df(super_ord_rows, ['orderStatus', 'ORDER_STATUS'])
+                state["order_quantity"] = entered_qty
+                state["remainingQuantity"] = rem_entry
+                state["STOP_LOSS_LEG_remainingQuantity"] = super_sl_rem
+                state["STOP_LOSS_LEG_status"] = _safe_str_from_df(super_ord_rows, ['STOP_LOSS_LEG_orderStatus', 'STOP_LOSS_LEG_status'])
+                state["entered_quantity"] = entered_qty
+                state["scalper_quantity"] = scalper_qty
+                state["runner_quantity"] = runner_qty
+
+                scalp_row = meta.get("scalp_order")
+                runner_row = meta.get("runner_order")
+
+                def _norm_field(r, field_candidates):
+                    if r is None:
+                        return None
+                    # row may be pandas Series or dict
+                    for c in field_candidates:
+                        try:
+                            if hasattr(r, "index") and c in r.index:
+                                return r.get(c)
+                        except Exception:
+                            pass
+                        if isinstance(r, dict) and c in r:
+                            return r.get(c)
+                    return None
+
+                state["scalp_sl_orderId"] = _norm_field(scalp_row, ["orderId", "order_id", "ORDER_ID"])
+                state["scalp_sl_status"] = _norm_field(scalp_row, ["orderStatus", "order_status", "ORDER_STATUS"])
+                state["scalp_sl_remainingQuantity"] = _norm_field(scalp_row, ["remainingQuantity", "remaining_quantity", "remainingQty"])
+                state["runner_sl_orderId"] = _norm_field(runner_row, ["orderId", "order_id", "ORDER_ID"])
+                state["runner_sl_status"] = _norm_field(runner_row, ["orderStatus", "order_status", "ORDER_STATUS"])
+                state["runner_sl_remainingQuantity"] = _norm_field(runner_row, ["remainingQuantity", "remaining_quantity", "remainingQty"])
+
+                # -----------------------------
+                # SIMPLE PRICE EXTRACTION (Dhan standard fields)
+                # -----------------------------
+                # If a normal SL is REJECTED/CANCELLED we deliberately set its price to None
+                def _status_upper(r):
+                    return (str(_norm_field(r, ["orderStatus", "order_status", "ORDER_STATUS"])) or "").upper()
+
+                # Scalp SL normal order prices (price, triggerPrice)
+                if scalp_row is not None and _status_upper(scalp_row) not in ("REJECTED", "CANCELLED"):
+                    try:
+                        state["scalp_sl_price"] = float(scalp_row.get("price", 0) or 0)
+                        state["scalp_sl_trigger_price"] = float(scalp_row.get("triggerPrice", 0) or 0)
+                    except Exception:
+                        logging.exception("Error parsing scalp order prices")
+                        state["scalp_sl_price"] = None
+                        state["scalp_sl_trigger_price"] = None
+                else:
+                    state["scalp_sl_price"] = None
+                    state["scalp_sl_trigger_price"] = None
+
+                # Runner SL normal order prices
+                if runner_row is not None and _status_upper(runner_row) not in ("REJECTED", "CANCELLED"):
+                    try:
+                        state["runner_sl_price"] = float(runner_row.get("price", 0) or 0)
+                        state["runner_sl_trigger_price"] = float(runner_row.get("triggerPrice", 0) or 0)
+                    except Exception:
+                        logging.exception("Error parsing runner order prices")
+                        state["runner_sl_price"] = None
+                        state["runner_sl_trigger_price"] = None
+                else:
+                    state["runner_sl_price"] = None
+                    state["runner_sl_trigger_price"] = None
+
+                # Entry average price from super order:
+                # NOTE: super_ord_rows may contain multiple rows but entry average should come from the ENTRY leg row.
+                # We attempt to find a row indicating entry/trade and fallback to first row.
+                entry_avg = None
+                try:
+                    entry_row = None
+                    # try to pick a row that looks like the entry leg (has averageTradedPrice or filledQty>0 or orderType entry)
+                    if isinstance(super_ord_rows, pd.DataFrame) and len(super_ord_rows) > 0:
+                        # priority: averageTradedPrice non-zero OR filledQty > 0
+                        for _, r in super_ord_rows.iterrows():
+                            if "averageTradedPrice" in r.index and safe_float(r.get("averageTradedPrice"), 0) > 0:
+                                entry_row = r
+                                break
+                            if "filledQty" in r.index and safe_float(r.get("filledQty"), 0) > 0:
+                                entry_row = r
+                                break
+                        if entry_row is None:
+                            entry_row = super_ord_rows.iloc[0]
+                    elif isinstance(super_ord_rows, (list, tuple)) and len(super_ord_rows) > 0:
+                        entry_row = super_ord_rows[0]
+                    if entry_row is not None and hasattr(entry_row, "get"):
+                        entry_avg = safe_float(entry_row.get("averageTradedPrice", None), None)
+                except Exception:
+                    logging.exception("Error extracting entry_avg_price from super_ord_rows")
+
+                state["entry_avg_price"] = entry_avg
+
+                # finalize mapping by classification
+                now_ts = datetime.now(kolkata_tz)
+                if classification == "Ready for Entry":
                     state.update({
-                        "position": "Ready for entry",
-                        "securityId": None,
-                        "orderId": None,
-                        "orderStatus": None,
-                        "quantity": 0.0,
-                        "remainingQuantity": 0.0,
-                        "STOP_LOSS_LEG_remainingQuantity": 0.0,
-                        "TARGET_LEG_remainingQuantity": 0.0,
-                        "STOP_LOSS_LEG_status": None,
-                        "TARGET_LEG_status": None,
-                        "exit_logic_active": False,
-                        "entry_timestamp": None,
-                        "entry_underlying_price": None,
-                        "note": "No net qty / no legs remaining — Ready for entry"
+                        "position": "Ready for Entry",
+                        "note": meta.get("reason") or "Ready for entry",
+                        "last_updated": now_ts
                     })
 
                 elif classification == "Entering":
-                    prev_state = position_status.get(leg_type, {})
-
                     state.update({
                         "position": "Entering",
-                        "securityId": secid,
-                        "orderId": order_id,
-                        "orderStatus": _safe_str_from_df(ord_rows, ['orderStatus', 'ORDER_STATUS']),
-                        "quantity": net_qty,
-                        "remainingQuantity": rem_entry,
-                        "STOP_LOSS_LEG_remainingQuantity": rem_sl,
-                        "TARGET_LEG_remainingQuantity": rem_tg,
-                        "STOP_LOSS_LEG_status": _safe_str_from_df(ord_rows, ['STOP_LOSS_LEG_orderStatus', 'STOP_LOSS_LEG_status']),
-                        "TARGET_LEG_status": _safe_str_from_df(ord_rows, ['TARGET_LEG_orderStatus', 'TARGET_LEG_status']),
-                        "note": "Entry order placed — awaiting fill"
+                        "note": meta.get("reason") or "Entry pending",
+                        "last_updated": now_ts
                     })
-                    # Preserve existing Phase-2 fields
-                    state["exit_logic_active"] = prev_state.get("exit_logic_active", False)
-                    state["entry_timestamp"] = prev_state.get("entry_timestamp", None)
-                    state["entry_underlying_price"] = prev_state.get("entry_underlying_price", None)
 
-
-
-                elif classification == "Partial_Entry":
-                    prev_state = position_status.get(leg_type, {})
-
+                elif classification == "Partial Entry":
                     state.update({
-                        "position": "Partial_Entry",
-                        "securityId": secid,
-                        "orderId": order_id,
-                        "orderStatus": _safe_str_from_df(ord_rows, ['orderStatus', 'ORDER_STATUS']),
-                        "quantity": net_qty,
-                        "remainingQuantity": rem_entry,
-                        "STOP_LOSS_LEG_remainingQuantity": rem_sl,
-                        "TARGET_LEG_remainingQuantity": rem_tg,
-                        "STOP_LOSS_LEG_status": _safe_str_from_df(ord_rows, ['STOP_LOSS_LEG_orderStatus', 'STOP_LOSS_LEG_status']),
-                        "TARGET_LEG_status": _safe_str_from_df(ord_rows, ['TARGET_LEG_orderStatus', 'TARGET_LEG_status']),
-                        "note": "Partial entry — some qty pending"
+                        "position": "Partial Entry",
+                        "note": meta.get("reason") or "Partial entry — some qty pending",
+                        "last_updated": now_ts
                     })
-                    # Preserve existing Phase-2 fields
-                    state["exit_logic_active"] = prev_state.get("exit_logic_active", False)
-                    state["entry_timestamp"] = prev_state.get("entry_timestamp", None)
-                    state["entry_underlying_price"] = prev_state.get("entry_underlying_price", None)
 
-
-                elif classification == "Open":
-                    # Preserve activation & entry info
-                    prev_state = position_status.get(leg_type, {})
-                    
+                elif classification == "Open - Full":
                     state.update({
-                        "position": "Open",
-                        "securityId": secid,
-                        "orderId": order_id,
-                        "orderStatus": _safe_str_from_df(ord_rows, ['orderStatus', 'ORDER_STATUS']),
-                        "quantity": net_qty,
-                        "remainingQuantity": rem_entry,
-                        "STOP_LOSS_LEG_remainingQuantity": rem_sl,
-                        "TARGET_LEG_remainingQuantity": rem_tg,
-                        "STOP_LOSS_LEG_status": _safe_str_from_df(ord_rows, ['STOP_LOSS_LEG_orderStatus', 'STOP_LOSS_LEG_status']),
-                        "TARGET_LEG_status": _safe_str_from_df(ord_rows, ['TARGET_LEG_orderStatus', 'TARGET_LEG_status']),
-                        "note": "Open position with SL/TG active"
+                        "position": "Open - Full",
+                        "note": meta.get("reason") or "Open with super-order SL active",
+                        "last_updated": now_ts
                     })
-                    # Preserve existing Phase-2 fields
-                    state["exit_logic_active"] = prev_state.get("exit_logic_active", False)
-                    state["entry_timestamp"] = prev_state.get("entry_timestamp", None)
-                    state["entry_underlying_price"] = prev_state.get("entry_underlying_price", None)
 
-                    # ---------------------------------------------------------
-                    # Phase-2 Simplified Restart Logic: always use SSMA exits
-                    # ---------------------------------------------------------
-                    if mode == 'startup':
-                        state["exit_logic_active"] = True
-                        state["entry_timestamp"] = None
-                        state["entry_underlying_price"] = None
-                        state["note"] += " | Restart detected → SSMA exit regime enabled"
-
-                elif classification in ("SL_Triggered", "TG_Triggered"):
-                    prev_state = position_status.get(leg_type, {})
-
+                elif classification == "Open - Scalping":
                     state.update({
-                        "position": "Triggered",
-                        "securityId": secid,
-                        "orderId": order_id,
-                        "orderStatus": _safe_str_from_df(ord_rows, ['orderStatus', 'ORDER_STATUS']),
-                        "quantity": net_qty,
-                        "remainingQuantity": rem_entry,
-                        "STOP_LOSS_LEG_remainingQuantity": rem_sl,
-                        "TARGET_LEG_remainingQuantity": rem_tg,
-                        "STOP_LOSS_LEG_status": _safe_str_from_df(ord_rows, ['STOP_LOSS_LEG_orderStatus', 'STOP_LOSS_LEG_status']),
-                        "TARGET_LEG_status": _safe_str_from_df(ord_rows, ['TARGET_LEG_orderStatus', 'TARGET_LEG_status']),
-                        "note": f"{classification} detected — awaiting broker confirmation"
+                        "position": "Open - Scalping",
+                        "note": meta.get("reason") or "Scalp + Runner normal SLs detected",
+                        "last_updated": now_ts
                     })
-                    # Preserve existing Phase-2 fields
-                    state["exit_logic_active"] = prev_state.get("exit_logic_active", False)
-                    state["entry_timestamp"] = prev_state.get("entry_timestamp", None)
-                    state["entry_underlying_price"] = prev_state.get("entry_underlying_price", None)
 
-                elif classification == "Orphan_SL_TG":
-
-                    # Always attempt to cancel all SL/TG legs
-                    orphan_cancelled_all = True
-                    for _, orow in ord_rows.iterrows():
-                        try:
-                            # parent super-order id
-                            oid = orow.get("orderId") or _safe_str_from_df(
-                                pd.DataFrame([orow]), ["orderId", "ORDER_ID"]
-                            )
-                            if oid:
-                                ok_sl, _ = cancel_super_order_leg(oid, "STOP_LOSS_LEG")
-                                ok_tg, _ = cancel_super_order_leg(oid, "TARGET_LEG")
-                                if not (ok_sl or ok_tg):
-                                    orphan_cancelled_all = False
-                        except Exception:
-                            orphan_cancelled_all = False
-
-                    # Final hard reset — ALWAYS reset Phase-2 fields
+                elif classification == "Open - Trailing":
                     state.update({
-                        "position": "Ready for entry",
-                        "securityId": None,
-                        "orderId": None,
-                        "orderStatus": None,
-                        "quantity": 0.0,
-                        "remainingQuantity": 0.0,
-                        "STOP_LOSS_LEG_remainingQuantity": 0.0,
-                        "TARGET_LEG_remainingQuantity": 0.0,
-                        "STOP_LOSS_LEG_status": None,
-                        "TARGET_LEG_status": None,
-
-                        # Phase-2 reset
-                        "exit_logic_active": False,
-                        "entry_timestamp": None,
-                        "entry_underlying_price": None,
-
-                        "note": (
-                            "Cancelled orphan SL/TG orders — reset Ready"
-                            if orphan_cancelled_all
-                            else "Orphan SL/TG present — cancel attempted or manual review"
-                        ),
+                        "position": "Open - Trailing",
+                        "note": meta.get("reason") or "Runner trailing SL detected",
+                        "last_updated": now_ts
                     })
 
+                elif classification == "Orphan_SL":
+                    state.update({
+                        "position": "Orphan_SL",
+                        "note": meta.get("reason") or "Orphan SL — cleanup required",
+                        "last_updated": now_ts
+                    })
 
                 elif classification == "True_Orphan":
                     state.update({
-                        "position": "Ready for entry",
-                        "securityId": secid,
-                        "quantity": net_qty,
-                        "orderStatus": None,
-                        "exit_logic_active": False,
-                        "entry_timestamp": None,
-                        "entry_underlying_price": None,
-                        "note": "True orphan (pos exists but no order) — marked Ready for entry"
+                        "position": "True_Orphan",
+                        "note": meta.get("reason") or "True orphan — no SL protection",
+                        "last_updated": now_ts
                     })
 
                 else:
                     state.update({
                         "position": "Unknown",
-                        "securityId": secid,
-                        "orderId": order_id,
-                        "quantity": net_qty,
-                        "remainingQuantity": rem_entry,
-                        "STOP_LOSS_LEG_remainingQuantity": rem_sl,
-                        "TARGET_LEG_remainingQuantity": rem_tg,
-                        "STOP_LOSS_LEG_status": _safe_str_from_df(ord_rows, ['STOP_LOSS_LEG_orderStatus', 'STOP_LOSS_LEG_status']),
-                        "TARGET_LEG_status": _safe_str_from_df(ord_rows, ['TARGET_LEG_orderStatus', 'TARGET_LEG_status']),
-                        "exit_logic_active": False,
-                        "entry_timestamp": None,
-                        "entry_underlying_price": None,
-                        "note": f"Unhandled numeric classification: {classification}"
+                        "note": meta.get("reason") or "Unknown classification",
+                        "last_updated": now_ts
                     })
 
-                # Timestamp
-                state["last_updated"] = datetime.now(kolkata_tz)
+                # persist
                 position_status[leg_type] = state
 
-
             except Exception as e:
-                logging.exception("Exception in %s leg: %s", leg_type, e)
+                logging.exception("Exception reconciling %s leg: %s", leg_type, e)
                 continue
 
-        logging.info(f"🔓 POSITION_LOCK released after {tag} reconciliation.")
-        logging.info(f"{tag} reconciliation completed → {position_status}")
+        logging.info("🔓 POSITION_LOCK released after %s reconciliation.", tag)
+        logging.info("%s reconciliation completed → %s", tag, position_status)
         logging.debug(json.dumps(position_status, indent=2, default=str))
-        polog.info(f"🔓 POSITION_LOCK released after {tag} reconciliation.")
-        polog.info(f"{tag} reconciliation completed → {position_status}")
-        polog.debug(json.dumps(position_status, indent=2, default=str))
+
+        try:
+            polog.info("🔓 POSITION_LOCK released after %s reconciliation.", tag)
+            polog.info("%s reconciliation completed → %s", tag, position_status)
+            polog.debug(json.dumps(position_status, indent=2, default=str))
+        except Exception:
+            # polog may not always be available / configured
+            pass
 
     return position_status
 
